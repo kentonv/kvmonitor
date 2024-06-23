@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width" />
+    <script>
+      function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
+
+      async function play() {
+        let element = document.getElementById('stream');
+
+        let mediaSource = new MediaSource();
+        element.src = URL.createObjectURL(mediaSource);
+        element.play();
+
+        if (mediaSource.readyState != "open") {
+          await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve));
+        }
+
+        let srcBuffer = mediaSource.addSourceBuffer('audio/webm; codecs="opus"');
+        srcBuffer.mode = "sequence";
+
+        let onUpdateEnd = () => {};
+        srcBuffer.addEventListener("updateend", () => {
+          onUpdateEnd();
+        });
+
+        let waitUpdate = async () => {
+          while (srcBuffer.updating) {
+            await new Promise(resolve => { onUpdateEnd = resolve; });
+            onUpdateEnd = () => {};
+          }
+        };
+
+        for (;;) {
+          try {
+            let resp = await fetch("/stream.webm");
+            let reader = resp.body.getReader();
+
+            for (;;) {
+              let {done, value: bytes} = await reader.read();
+
+              if (done) {
+                console.log("stream ended???");
+                break;
+              }
+
+              await waitUpdate();
+
+              if (srcBuffer.buffered.length > 0 &&
+                  element.currentTime > srcBuffer.buffered.start(0) + 5) {
+                srcBuffer.remove(0, element.currentTime - 1);
+              }
+
+              await waitUpdate();
+
+              srcBuffer.appendBuffer(bytes);
+            }
+          } catch (err) {
+            console.error(err.stack);
+          }
+
+          await sleep(1000);
+          console.log("trying again...");
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <audio id="stream" controls preload="none"></audio>
+
+    <p><button onclick="play(); event.currentTarget.style = 'display: none;'" style="width: 100%; height: 96px; font-size: 200%;">start</button></p>
+  </body>
+</html>

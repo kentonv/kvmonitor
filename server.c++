@@ -26,6 +26,8 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 
+#include "client.html.h"
+
 namespace kvmonitor {
 
 // =======================================================================================
@@ -289,7 +291,8 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
 
 // =======================================================================================
 
-void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out) {
+void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
+                 kj::StringPtr filename) {
   AVFormatContext* formatCtx = KJ_AVCALL(avformat_alloc_context());
   KJ_DEFER(avformat_free_context(formatCtx));
 
@@ -344,7 +347,7 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out) {
   memcpy(stream->codecpar->extradata, OPUS_DEFAULT_EXTRADATA, 19);
   stream->codecpar->extradata[9] = layout.nb_channels;  // REALLY???
 
-  formatCtx->oformat = KJ_AVCALL(av_guess_format(nullptr, nullptr, "audio/ogg"));
+  formatCtx->oformat = KJ_AVCALL(av_guess_format(nullptr, filename.cStr(), nullptr));
 
   KJ_AVCALL(avformat_write_header(formatCtx, nullptr));
 
@@ -355,6 +358,7 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out) {
   codecCtx->codec_id = codec->id;
   codecCtx->sample_rate = 48000;
   codecCtx->bit_rate = 64000;
+  codecCtx->time_base = {1, codecCtx->sample_rate};
   av_channel_layout_copy(&codecCtx->ch_layout, &layout);
   codecCtx->sample_fmt = AV_SAMPLE_FMT_FLT;
 
@@ -373,13 +377,14 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out) {
   frame->sample_rate = codecCtx->sample_rate;
   frame->format = codecCtx->sample_fmt;
   frame->pts = 0;
-  frame->time_base = {1, frame->sample_rate};
+  frame->time_base = {1, codecCtx->sample_rate};
 
   uint inputOffsets[ringBuffers.size()];
   for (auto i: kj::zeroTo(ringBuffers.size())) {
     inputOffsets[i] = 0;
   }
 
+  uint64_t totalSamples = 0;
   for (uint counter = 0; !state.disconnected; counter++) {
     {
       auto samples = kj::arrayPtr(reinterpret_cast<float*>(frame->data[0]), frame->nb_samples);
@@ -391,7 +396,8 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out) {
 
       KJ_AVCALL(avcodec_send_frame(codecCtx, frame));
 
-      frame->pts += frame->nb_samples;
+      totalSamples += frame->nb_samples;
+      frame->pts = totalSamples * frame->time_base.den / frame->sample_rate;
     }
 
     // Note to self: To trigger EOF, do:
@@ -419,18 +425,6 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out) {
 
 // =======================================================================================
 
-static constexpr kj::StringPtr PAGE_HTML = R"#(
-<!DOCTYPE html>
-
-<html>
-  <body>
-    <audio id="stream" controls src="/stream.ogg" preload="none"></audio>
-
-    <p><button onclick="document.getElementById('stream').play(); event.currentTarget.style = 'display: none;'" style="width: 100%; height: 96px; font-size: 200%;">start</button></p>
-  </body>
-</html>
-)#"_kj;
-
 class HttpServiceImpl: public kj::HttpService {
 public:
   HttpServiceImpl(kj::HttpHeaderTable& headerTable): headerTable(headerTable) {}
@@ -438,6 +432,7 @@ public:
   kj::Promise<void> request(
       kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) override {
+    KJ_DBG(url);
     if (url != "/"_kj) {
       co_await response.sendError(404, "Not Found", kj::HttpHeaders(headerTable));
       co_return;
@@ -447,10 +442,13 @@ public:
       co_return;
     }
 
+    kj::ArrayPtr<const byte> bytes = CLIENT_HTML.asBytes();
+    kj::StringPtr contentType = "text/html;charset=UTF-8"_kj;
+
     kj::HttpHeaders responseHeaders(headerTable);
-    responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, "text/html;charset=UTF-8");
-    auto stream = response.send(200, "OK", headers);
-    co_await stream->write(PAGE_HTML.begin(), PAGE_HTML.size());
+    responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, contentType);
+    auto stream = response.send(200, "OK", responseHeaders, bytes.size());
+    co_await stream->write(bytes.begin(), bytes.size());
   }
 
 private:
@@ -526,7 +524,10 @@ public:
       auto suspendCallback = [&](kj::HttpServer::SuspendableRequest& req)
           -> kj::Maybe<kj::Own<kj::HttpService>> {
         auto method = req.method.tryGet<kj::HttpMethod>().orDefault(kj::HttpMethod::COPY);
-        if (req.url == "/stream.ogg" && method == kj::HttpMethod::GET) {
+        if ((req.url == "/stream.ogg" || req.url == "/stream.webm") &&
+            method == kj::HttpMethod::GET) {
+          auto filename = kj::str(req.url.slice(1));
+
           // Requesting the stream. Hand off to a thread.
           auto suspended = req.suspend();
 
@@ -534,7 +535,8 @@ public:
           KJ_SYSCALL(fd_ = dup(KJ_ASSERT_NONNULL(conn->getFd())));
           kj::AutoCloseFd sock(fd_);
 
-          kj::Thread([sock = kj::mv(sock), ringBuffers = ringBuffers.asPtr()]() mutable noexcept {
+          kj::Thread([sock = kj::mv(sock), ringBuffers = ringBuffers.asPtr(),
+                      filename = kj::mv(filename)]() mutable noexcept {
             try {
               // Turn off non-blocking I/O.
               {
@@ -548,7 +550,7 @@ public:
                   "Content-Type: audio/ogg\r\n"
                   "\r\n");
               out.write(headers.asBytes());
-              writeStream(ringBuffers, out);
+              writeStream(ringBuffers, out, filename);
             } catch (...) {
               KJ_LOG(ERROR, kj::getCaughtExceptionAsKj());
             }
