@@ -34,6 +34,8 @@
           }
         };
 
+        let lastLatency = 0;
+
         for (;;) {
           try {
             let resp = await fetch("/stream.webm");
@@ -49,9 +51,29 @@
 
               await waitUpdate();
 
-              if (srcBuffer.buffered.length > 0 &&
-                  element.currentTime > srcBuffer.buffered.start(0) + 5) {
-                srcBuffer.remove(0, element.currentTime - 1);
+              if (srcBuffer.buffered.length > 0) {
+                let start = srcBuffer.buffered.start(0);
+                let end = srcBuffer.buffered.end(srcBuffer.buffered.length - 1);
+
+                // Don't fall too far behind in the local buffer.
+                // However, in my tests, I've found that even on a LAN, my phone sometimes
+                // needs a few seconds of buffer to avoid chopping.
+                if (element.currentTime + 5 < end) {
+                  element.currentTime = end - 0.5;
+                }
+
+                if (element.currentTime > start + 5) {
+                  srcBuffer.remove(0, element.currentTime - 1);
+                }
+
+                let latency = end - element.currentTime;
+
+                if (document.visibilityState == "visible") {
+                  if (latency < lastLatency - 0.1 || latency > lastLatency + 0.1) {
+                    infoElement.innerText = "Latency: " + (Math.round(latency * 10) / 10);
+                    lastLatency = latency;
+                  }
+                }
               }
 
               await waitUpdate();
