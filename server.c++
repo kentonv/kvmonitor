@@ -333,7 +333,16 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   // may not even be the original pointer we passed to avio_alloc_context()? WTF?
   KJ_DEFER(av_free(formatCtx->pb->buffer));
 
-  const AVCodec *codec = KJ_AVCALL(avcodec_find_encoder(AV_CODEC_ID_OPUS));
+  AVCodecID codecId = AV_CODEC_ID_OPUS;
+  if (filename.endsWith(".aac")) {
+    // TODO: AAC format doesn't seem to work. ffmpeg produces some sort of invalid output. I
+    // can't figure out why. So for now we make iPhone use mp3 (which sucks).
+    codecId = AV_CODEC_ID_AAC;
+  } else if (filename.endsWith(".mp3")) {
+    codecId = AV_CODEC_ID_MP3;
+  }
+
+  const AVCodec *codec = KJ_AVCALL(avcodec_find_encoder(codecId));
 
   AVChannelLayout layout = AV_CHANNEL_LAYOUT_MONO;
 
@@ -342,27 +351,48 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   stream->codecpar->sample_rate = 48000;
   av_channel_layout_copy(&stream->codecpar->ch_layout, &layout);
   stream->codecpar->format = AV_SAMPLE_FMT_FLT;
-  stream->codecpar->codec_id = AV_CODEC_ID_OPUS;
-  stream->codecpar->bit_rate = 64000;
-  stream->codecpar->extradata = reinterpret_cast<uint8_t*>(av_malloc(19));
-  stream->codecpar->extradata_size = 19;
-  memcpy(stream->codecpar->extradata, OPUS_DEFAULT_EXTRADATA, 19);
-  stream->codecpar->extradata[9] = layout.nb_channels;  // REALLY???
+  stream->codecpar->codec_id = codecId;
+  if (codecId == AV_CODEC_ID_OPUS) {
+    stream->codecpar->bit_rate = 64000;
+    stream->codecpar->extradata = reinterpret_cast<uint8_t*>(av_malloc(19));
+    stream->codecpar->extradata_size = 19;
+    memcpy(stream->codecpar->extradata, OPUS_DEFAULT_EXTRADATA, 19);
+    stream->codecpar->extradata[9] = layout.nb_channels;  // REALLY???
+  } else if (codecId == AV_CODEC_ID_AAC) {
+    stream->codecpar->bit_rate = 0;
+
+    // This is the extradata my camera gives me idk.
+    stream->codecpar->extradata = reinterpret_cast<uint8_t*>(av_malloc(2));
+    stream->codecpar->extradata[0] = 17;
+    stream->codecpar->extradata[1] = 136;
+  } else if (codecId == AV_CODEC_ID_MP3) {
+    stream->codecpar->bit_rate = 64000;
+  }
+  stream->time_base = {1, stream->codecpar->sample_rate};
 
   formatCtx->oformat = KJ_AVCALL(av_guess_format(nullptr, filename.cStr(), nullptr));
+
+  // Does this matter?
+  formatCtx->url = KJ_AVCALL(av_strdup(filename.cStr()));
 
   KJ_AVCALL(avformat_write_header(formatCtx, nullptr));
 
   AVCodecContext* codecCtx = KJ_AVCALL(avcodec_alloc_context3(codec));
   KJ_DEFER(avcodec_free_context(&codecCtx));
 
-  // Choose channel layout.
-  codecCtx->codec_id = codec->id;
-  codecCtx->sample_rate = 48000;
-  codecCtx->bit_rate = 64000;
+  // Copy params from stream.
+  avcodec_parameters_to_context(codecCtx, stream->codecpar);
+
+  // ffmpeg changes stream->time_base to 1/1000 during avformat_write_header. If we use that here,
+  // nothing works. We have to set it back to 1/48000.
   codecCtx->time_base = {1, codecCtx->sample_rate};
-  av_channel_layout_copy(&codecCtx->ch_layout, &layout);
-  codecCtx->sample_fmt = AV_SAMPLE_FMT_FLT;
+  codecCtx->pkt_timebase = codecCtx->time_base;
+
+  // You have to copy this bit over for some encoders. For whatever reasons, ffmpeg will not
+  // figure it out for you?
+  if (formatCtx->oformat->flags & AVFMT_GLOBALHEADER) {
+    codecCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+  }
 
   KJ_AVCALL(avcodec_open2(codecCtx, codec, nullptr));
 
@@ -389,7 +419,11 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   uint64_t totalSamples = 0;
   uint samplesSinceFlush = 0;
   for (uint counter = 0; !state.disconnected; counter++) {
-    {
+    if (codecId == AV_CODEC_ID_AAC && counter >= 100) {
+      // TODO: I'm only returning 1s of audio for AAC for debugging reasons... once it actually
+      // works, remove the above.
+      KJ_AVCALL(avcodec_send_frame(codecCtx, nullptr));
+    } else {
       auto samples = kj::arrayPtr(reinterpret_cast<float*>(frame->data[0]), frame->nb_samples);
       for (auto i: kj::zeroTo(ringBuffers.size())) {
         // Don't get more than 1s behind.
@@ -534,7 +568,8 @@ public:
       auto suspendCallback = [&](kj::HttpServer::SuspendableRequest& req)
           -> kj::Maybe<kj::Own<kj::HttpService>> {
         auto method = req.method.tryGet<kj::HttpMethod>().orDefault(kj::HttpMethod::COPY);
-        if ((req.url == "/stream.ogg" || req.url == "/stream.webm") &&
+        if ((req.url == "/stream.ogg" || req.url == "/stream.webm" ||
+             req.url == "/stream.aac" || req.url == "/stream.mp3") &&
             method == kj::HttpMethod::GET) {
           auto filename = kj::str(req.url.slice(1));
 
