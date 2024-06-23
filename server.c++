@@ -298,9 +298,10 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
 
   struct State {
     kj::OutputStream& out;
+    kj::Vector<byte> outputBuffer;
     bool disconnected;
   };
-  State state {out, false};
+  State state {out, kj::Vector<byte>(65536), false};
 
   formatCtx->pb = KJ_AVCALL(avio_alloc_context(
       reinterpret_cast<byte*>(av_malloc(65536)),
@@ -310,7 +311,8 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
         auto& state = *reinterpret_cast<State*>(opaque);
         if (!state.disconnected) {
           try {
-            state.out.write(kj::arrayPtr(buf, size));
+            state.outputBuffer.addAll(kj::arrayPtr(buf, size));
+            //state.out.write(kj::arrayPtr(buf, size));
           } catch (...) {
             auto e = kj::getCaughtExceptionAsKj();
             if (e.getType() == kj::Exception::Type::DISCONNECTED) {
@@ -385,6 +387,7 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   }
 
   uint64_t totalSamples = 0;
+  uint samplesSinceFlush = 0;
   for (uint counter = 0; !state.disconnected; counter++) {
     {
       auto samples = kj::arrayPtr(reinterpret_cast<float*>(frame->data[0]), frame->nb_samples);
@@ -397,6 +400,7 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
       KJ_AVCALL(avcodec_send_frame(codecCtx, frame));
 
       totalSamples += frame->nb_samples;
+      samplesSinceFlush += frame->nb_samples;
       frame->pts = totalSamples * frame->time_base.den / frame->sample_rate;
     }
 
@@ -419,6 +423,12 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
       }
 
       KJ_AVCALL(av_write_frame(formatCtx, packet));
+    }
+
+    if (samplesSinceFlush > frame->sample_rate / 5) {
+      state.out.write(state.outputBuffer.asPtr());
+      state.outputBuffer.resize(0);
+      samplesSinceFlush = 0;
     }
   }
 }
