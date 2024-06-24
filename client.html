@@ -14,14 +14,39 @@
         }
       }
 
-      function playIos() {
+      function playCompatible() {
+        // Play the stream in a way compatible with most browsers (including iOS):
+        // - By just directly pointing the <audio> element at it.
+        // - Using mp3 format because Apple hates open standards like WebM and Ogg, and I can't
+        //   get ffmpeg to produce a working AAC stream for some reason.
+        //
+        // This is simple, but suffers from severe latency. The <audio> element wants to buffer
+        // 5-10 seconds of audio before it is willing to start playing, because it assumes it is
+        // downloading a file and that network speeds may be unreliable, and of course it sees it
+        // is getting audio at exactly 1:1 with real time so it figures it better have some buffer.
+        // There is no direct way to tell it not to do this, for some reason.
+
         hideButtons();
         let element = document.getElementById('stream');
         element.src = "/stream.mp3";
         element.play();
       }
 
-      async function play() {
+      async function playLowLatency() {
+        // Play the stream by using the `MediaSource` API such that we can feed the audio buffer
+        // dynamically. In this mode, the browser doesn't insist on waiting for any amount of
+        // buffering before it starts playing. However, we have to do a LOT of work to manually
+        // manage the buffer.
+        //
+        // This achieves a low-latency stream, but does not work on iPhone. According to MDN, this
+        // API is supported by Safari on Mac and iPad (I haven't tested), but not on iPhone (where
+        // I can confirm it doesn't work). If they have the code, why not enable it? I don't know,
+        // but I do observe that this API is useful for building media streaming apps in web
+        // browsers, where they would of course not be subject to the 30% Apple Tax. Draw your own
+        // conclusions?
+        //
+        // Anyway it works great on Android.
+
         hideButtons();
         let element = document.getElementById('stream');
         let infoElement = document.getElementById("info");
@@ -30,18 +55,35 @@
         element.src = URL.createObjectURL(mediaSource);
         element.play();
 
+        // Apparently, we must wait for the MediaSource to become "open" otherwise the next lines
+        // will throw.
         if (mediaSource.readyState != "open") {
           await new Promise(resolve => mediaSource.addEventListener('sourceopen', resolve));
         }
 
+        // On Chrome, MediaSource seems to ONLY support the webm container format; it was not happy
+        // with Ogg.
         let srcBuffer = mediaSource.addSourceBuffer('audio/webm; codecs="opus"');
+
+        // EXTREMELY IMPORTANT: If we leave the buffer mode as its default "segments", then it
+        // attempts to use the timestamps embedded in each and every packet to decide what part of
+        // the stream that packet represents. This seemingly allows packets to be delivered
+        // out-of-order? However, our packets are strictly in order. But ffmpeg seems to produce
+        // the timestamps in such a way that the browser thinks it is getting an extremely
+        // fragmented audio stream. It's as if the browser is expecting timestamps in milliseconds
+        // but ffmpeg is sending them in sample counts -- so after every frame of audio there
+        // appears to be a 48-frame gap (the sample rate being 48,000/s). I'm probably using ffmpeg
+        // wrong in some way, because the API is utterly terrible. But if we set the mode to
+        // "sequence" here, then the browser ignores the timestamps and just assumes all the
+        // packets represent sequential audio, which is what we want. Yay?
         srcBuffer.mode = "sequence";
 
+        // When `SourceBuffer` is in `updating` state, trying to do anything to it will throw. So
+        // we define `waitUpdate()` as a helper that waits for it to finish.
         let onUpdateEnd = () => {};
         srcBuffer.addEventListener("updateend", () => {
           onUpdateEnd();
         });
-
         let waitUpdate = async () => {
           while (srcBuffer.updating) {
             await new Promise(resolve => { onUpdateEnd = resolve; });
@@ -53,6 +95,7 @@
 
         for (;;) {
           try {
+            // Do a streaming fetch.
             let resp = await fetch("/stream.webm");
             let reader = resp.body.getReader();
 
@@ -60,9 +103,14 @@
               let {done, value: bytes} = await reader.read();
 
               if (done) {
+                // EOF. Should only happen if the server was killed.
                 console.log("stream ended???");
                 break;
               }
+
+              await waitUpdate();
+
+              srcBuffer.appendBuffer(bytes);
 
               await waitUpdate();
 
@@ -70,35 +118,64 @@
                 let start = srcBuffer.buffered.start(0);
                 let end = srcBuffer.buffered.end(srcBuffer.buffered.length - 1);
 
-                // Don't fall too far behind in the local buffer.
-                // However, in my tests, I've found that even on a LAN, my phone sometimes
-                // needs a few seconds of buffer to avoid chopping.
+                // Over time, the stream may fall behind real time, maybe due to audio timing being
+                // non-exact, but more commonly because of network stutters. In particular, when the
+                // phone screen is off, the OS seemingly won't execute the app as often, preferring
+                // to batch up a couple seconds of data and deliver it all at once. The audio may
+                // stutter if it reaches the end of the buffer, and then when the app does wake up,
+                // we'll refill the buffer, and suddenly we have a whole lot of data buffered and
+                // the current play position is behind.
+                //
+                // We can try to seek forward in order to cut the latency down again, but if we do
+                // so too aggressively, the stream will stutter a lot, as it repeatedly reaches the
+                // end of the buffer, stops, waits, gets more data delivered, discovers it is now
+                // behind again, and skips forward again.
+                //
+                // I've found that I have to tolerate about 5 seconds of latency in order to avoid
+                // constant stuttering when the phone screen is off. If we see we're behind by MORE
+                // than 5 seconds, then probably there was a temporary network glitch, and we'd
+                // rather skip forward to correct the latency.
+                //
+                // So, if latency is over 5 seconds, skip forward to 500ms. Note that if conditions
+                // don't support maintaining 500ms latency, then there will be some stuttering
+                // shortly after this seek, which will push latency back up to the natural
+                // equilibrium.
+                //
+                // TODO: We could actually keep track of our buffer size over time and if over the
+                // course of, say, 10 seconds, it never drops below some point, then seek forward
+                // to exactly that point. This would keep latency minimal at the cost of risking a
+                // stutter whenever conditions get worse than they have been over the last 10s.
                 if (element.currentTime + 5 < end) {
                   element.currentTime = end - 0.5;
                 }
 
+                // Drop old data from the buffer to free up memory. Important when running the
+                // stream continuously for hours! Whenever the current play point is 5s beyond the
+                // start of the buffer, discard the buffer up to 1s behind the current play point.
                 if (element.currentTime > start + 5) {
                   srcBuffer.remove(0, element.currentTime - 1);
                 }
 
-                let latency = end - element.currentTime;
-
+                // If the app is currently displayed on the screen, show the user the current
+                // buffer latency. (If not displayed, skip this to avoid wasting any battery.)
+                //
+                // Note this displays the latency of the local buffer only, not end-to-end. But
+                // because we just received a packet of data before calculating this, we know the
+                // server buffer is empty, and so we should be very close to real time.
                 if (document.visibilityState == "visible") {
+                  let latency = end - element.currentTime;
                   if (latency < lastLatency - 0.1 || latency > lastLatency + 0.1) {
                     infoElement.innerText = "Latency: " + (Math.round(latency * 10) / 10);
                     lastLatency = latency;
                   }
                 }
               }
-
-              await waitUpdate();
-
-              srcBuffer.appendBuffer(bytes);
             }
           } catch (err) {
             console.error(err.stack);
           }
 
+          // Wait a second and then reconnect.
           await sleep(1000);
           console.log("trying again...");
         }
@@ -108,9 +185,9 @@
   <body>
     <audio id="stream" controls preload="none"></audio>
 
-    <p><button onclick="play()" style="width: 100%; height: 96px; font-size: 200%;">start</button></p>
+    <p><button onclick="playLowLatency()" style="width: 100%; height: 96px; font-size: 200%;">start</button></p>
 
-    <p><button onclick="playIos()" style="width: 100%; height: 96px; font-size: 200%;">start (iPhone)</button></p>
+    <p><button onclick="playCompatible()" style="width: 100%; height: 96px; font-size: 200%;">start (iPhone)</button></p>
 
     <p id="info"></p>
   </body>
