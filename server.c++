@@ -411,7 +411,7 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   frame->pts = 0;
   frame->time_base = {1, codecCtx->sample_rate};
 
-  uint inputOffsets[ringBuffers.size()];
+  uint64_t inputOffsets[ringBuffers.size()];
   for (auto i: kj::zeroTo(ringBuffers.size())) {
     inputOffsets[i] = 0;
   }
