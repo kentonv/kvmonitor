@@ -492,7 +492,7 @@ public:
     kj::HttpHeaders responseHeaders(headerTable);
     responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, contentType);
     auto stream = response.send(200, "OK", responseHeaders, bytes.size());
-    co_await stream->write(bytes.begin(), bytes.size());
+    co_await stream->write(bytes);
   }
 
 private:
