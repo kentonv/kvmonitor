@@ -33,6 +33,8 @@ namespace kvmonitor {
 // =======================================================================================
 // utility code for KJ+ffmpeg
 
+const int TIMESTAMP_SCALE = 1000; // Millisecond time base.
+
 const int LINESIZE_ALIGNMENT = 32;   // idk, internet told me so?
 
 static const uint8_t OPUS_DEFAULT_EXTRADATA[19] = {
@@ -277,7 +279,7 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
     }
 
     {
-      auto dataDuration = totalSamples * 1000 / stream->codecpar->sample_rate * kj::MILLISECONDS;
+      auto dataDuration = totalSamples * TIMESTAMP_SCALE / stream->codecpar->sample_rate * kj::MILLISECONDS;
       auto actualDuration = clock.now() - startTime;
 
       if (actualDuration + 5 * kj::SECONDS < dataDuration ||
@@ -368,7 +370,7 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   } else if (codecId == AV_CODEC_ID_MP3) {
     stream->codecpar->bit_rate = 64000;
   }
-  stream->time_base = {1, stream->codecpar->sample_rate};
+  stream->time_base = {1, TIMESTAMP_SCALE};
 
   formatCtx->oformat = KJ_AVCALL(av_guess_format(nullptr, filename.cStr(), nullptr));
 
@@ -382,11 +384,6 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
 
   // Copy params from stream.
   avcodec_parameters_to_context(codecCtx, stream->codecpar);
-
-  // ffmpeg changes stream->time_base to 1/1000 during avformat_write_header. If we use that here,
-  // nothing works. We have to set it back to 1/48000.
-  codecCtx->time_base = {1, codecCtx->sample_rate};
-  codecCtx->pkt_timebase = codecCtx->time_base;
 
   // You have to copy this bit over for some encoders. For whatever reasons, ffmpeg will not
   // figure it out for you?
@@ -409,7 +406,6 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   frame->sample_rate = codecCtx->sample_rate;
   frame->format = codecCtx->sample_fmt;
   frame->pts = 0;
-  frame->time_base = {1, codecCtx->sample_rate};
 
   uint64_t inputOffsets[ringBuffers.size()];
   for (auto i: kj::zeroTo(ringBuffers.size())) {
@@ -435,7 +431,14 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
 
       totalSamples += frame->nb_samples;
       samplesSinceFlush += frame->nb_samples;
-      frame->pts = totalSamples * frame->time_base.den / frame->sample_rate;
+
+      // This is a hack. Setting PTS correctly would look like this:
+      //
+      // frame->pts = totalSamples * TIMESTAMP_SCALE / frame->sample_rate;
+      //
+      // However DTS must be adjusted accordingly to avoid "Queue input is backward in time"
+      // warnings while streaming. Tweak both below, before sending each packet.
+      frame->pts = totalSamples;
     }
 
     // Note to self: To trigger EOF, do:
@@ -455,6 +458,9 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
       } else if (result < 0) {
         KJ_FAIL_ASSERT("avcodec_receive_frame()", result, avError(result));
       }
+
+      packet->pts = packet->pts * TIMESTAMP_SCALE / frame->sample_rate;
+      packet->dts = packet->dts * TIMESTAMP_SCALE / frame->sample_rate;
 
       KJ_AVCALL(av_write_frame(formatCtx, packet));
     }
