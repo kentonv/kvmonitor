@@ -33,12 +33,9 @@ namespace kvmonitor {
 // =======================================================================================
 // utility code for KJ+ffmpeg
 
-const int LINESIZE_ALIGNMENT = 32;   // idk, internet told me so?
+const int TIMESTAMP_SCALE = 1000; // Millisecond time base.
 
-static const uint8_t OPUS_DEFAULT_EXTRADATA[19] = {
-  'O', 'p', 'u', 's', 'H', 'e', 'a', 'd',
-  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
+const int LINESIZE_ALIGNMENT = 32;   // idk, internet told me so?
 
 kj::String avError(int error) {
   char buffer[4096];
@@ -277,7 +274,7 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
     }
 
     {
-      auto dataDuration = totalSamples * 1000 / stream->codecpar->sample_rate * kj::MILLISECONDS;
+      auto dataDuration = totalSamples * TIMESTAMP_SCALE / stream->codecpar->sample_rate * kj::MILLISECONDS;
       auto actualDuration = clock.now() - startTime;
 
       if (actualDuration + 5 * kj::SECONDS < dataDuration ||
@@ -335,8 +332,8 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
 
   AVCodecID codecId = AV_CODEC_ID_OPUS;
   if (filename.endsWith(".aac")) {
-    // TODO: AAC format doesn't seem to work. ffmpeg produces some sort of invalid output. I
-    // can't figure out why. So for now we make iPhone use mp3 (which sucks).
+    // TODO: AAC format doesn't work.
+    // It doesn't play on Chrome, and on Firefox the audio is slow and lags behind.
     codecId = AV_CODEC_ID_AAC;
   } else if (filename.endsWith(".mp3")) {
     codecId = AV_CODEC_ID_MP3;
@@ -347,28 +344,39 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   AVChannelLayout layout = AV_CHANNEL_LAYOUT_MONO;
 
   AVStream* stream = avformat_new_stream(formatCtx, codec);
-  stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-  stream->codecpar->sample_rate = 48000;
-  av_channel_layout_copy(&stream->codecpar->ch_layout, &layout);
-  stream->codecpar->format = AV_SAMPLE_FMT_FLT;
   stream->codecpar->codec_id = codecId;
+  stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+  stream->codecpar->bit_rate = 64000;
+  stream->codecpar->sample_rate = 48000;
+  stream->codecpar->format = AV_SAMPLE_FMT_FLTP;
+  av_channel_layout_copy(&stream->codecpar->ch_layout, &layout);
+  stream->time_base = {1, TIMESTAMP_SCALE};
   if (codecId == AV_CODEC_ID_OPUS) {
-    stream->codecpar->bit_rate = 64000;
-    stream->codecpar->extradata = reinterpret_cast<uint8_t*>(av_malloc(19));
-    stream->codecpar->extradata_size = 19;
-    memcpy(stream->codecpar->extradata, OPUS_DEFAULT_EXTRADATA, 19);
-    stream->codecpar->extradata[9] = layout.nb_channels;  // REALLY???
+    // Opus extra data (19 bytes total).
+    uint8_t opus_header[] = {
+        'O', 'p', 'u', 's', 'H', 'e', 'a', 'd',    // Signature='OpusHead' (8 bytes)
+        0x01,                                      // Version=1
+        static_cast<uint8_t>(layout.nb_channels),  // Channels=1
+        0x00, 0x00,                                // Pre-skip=0
+        0x80, 0xBB, 0x00, 0x00,                    // Input sample rate=48000
+        0x00, 0x00,                                // Output gain=0
+        0x00                                       // Channel mapping family=0
+    };
+    stream->codecpar->extradata = (uint8_t*)av_memdup(opus_header, sizeof(opus_header));
+    stream->codecpar->extradata_size = sizeof(opus_header);
   } else if (codecId == AV_CODEC_ID_AAC) {
-    stream->codecpar->bit_rate = 0;
-
-    // This is the extradata my camera gives me idk.
-    stream->codecpar->extradata = reinterpret_cast<uint8_t*>(av_malloc(2));
-    stream->codecpar->extradata[0] = 17;
-    stream->codecpar->extradata[1] = 136;
+    // AAC extra data (2 bytes total).
+    uint8_t aac_header[] = {
+        0x12,                                         // Profile=AAC-LC(1<<3) | SamplingIndex=48kHz(4)
+        static_cast<uint8_t>(layout.nb_channels << 3) // Channel config
+    };
+    stream->codecpar->extradata = (uint8_t*)av_memdup(aac_header, sizeof(aac_header));
+    stream->codecpar->extradata_size = sizeof(aac_header);
+    stream->codecpar->profile = FF_PROFILE_AAC_LOW;
   } else if (codecId == AV_CODEC_ID_MP3) {
-    stream->codecpar->bit_rate = 64000;
+    // FLT (packed float) is optimal for legacy codecs, including MP3.
+    stream->codecpar->format = AV_SAMPLE_FMT_FLT;
   }
-  stream->time_base = {1, stream->codecpar->sample_rate};
 
   formatCtx->oformat = KJ_AVCALL(av_guess_format(nullptr, filename.cStr(), nullptr));
 
@@ -382,11 +390,6 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
 
   // Copy params from stream.
   avcodec_parameters_to_context(codecCtx, stream->codecpar);
-
-  // ffmpeg changes stream->time_base to 1/1000 during avformat_write_header. If we use that here,
-  // nothing works. We have to set it back to 1/48000.
-  codecCtx->time_base = {1, codecCtx->sample_rate};
-  codecCtx->pkt_timebase = codecCtx->time_base;
 
   // You have to copy this bit over for some encoders. For whatever reasons, ffmpeg will not
   // figure it out for you?
@@ -409,7 +412,6 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   frame->sample_rate = codecCtx->sample_rate;
   frame->format = codecCtx->sample_fmt;
   frame->pts = 0;
-  frame->time_base = {1, codecCtx->sample_rate};
 
   uint64_t inputOffsets[ringBuffers.size()];
   for (auto i: kj::zeroTo(ringBuffers.size())) {
@@ -419,27 +421,25 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
   uint64_t totalSamples = 0;
   uint samplesSinceFlush = 0;
   for (uint counter = 0; !state.disconnected; counter++) {
-    if (codecId == AV_CODEC_ID_AAC && counter >= 100) {
-      // TODO: I'm only returning 1s of audio for AAC for debugging reasons... once it actually
-      // works, remove the above.
-      KJ_AVCALL(avcodec_send_frame(codecCtx, nullptr));
-    } else {
-      auto samples = kj::arrayPtr(reinterpret_cast<float*>(frame->data[0]), frame->nb_samples);
-      for (auto i: kj::zeroTo(ringBuffers.size())) {
-        // Don't get more than 1s behind.
-        size_t maxLag = inputOffsets[i] == 0 ? 0 : frame->sample_rate * sizeof(float);
-        inputOffsets[i] = ringBuffers[i].read(inputOffsets[i], maxLag, samples.asBytes(), i > 0);
-      }
-
-      KJ_AVCALL(avcodec_send_frame(codecCtx, frame));
-
-      totalSamples += frame->nb_samples;
-      samplesSinceFlush += frame->nb_samples;
-      frame->pts = totalSamples * frame->time_base.den / frame->sample_rate;
+    auto samples = kj::arrayPtr(reinterpret_cast<float*>(frame->data[0]), frame->nb_samples);
+    for (auto i: kj::zeroTo(ringBuffers.size())) {
+      // Don't get more than 1s behind.
+      size_t maxLag = inputOffsets[i] == 0 ? 0 : frame->sample_rate * sizeof(float);
+      inputOffsets[i] = ringBuffers[i].read(inputOffsets[i], maxLag, samples.asBytes(), i > 0);
     }
 
-    // Note to self: To trigger EOF, do:
-    //   KJ_AVCALL(avcodec_send_frame(codecCtx, nullptr));
+    KJ_AVCALL(avcodec_send_frame(codecCtx, frame));
+
+    totalSamples += frame->nb_samples;
+    samplesSinceFlush += frame->nb_samples;
+
+    // This is a hack. Setting PTS correctly would look like this:
+    //
+    // frame->pts = totalSamples * TIMESTAMP_SCALE / frame->sample_rate;
+    //
+    // However DTS must be adjusted accordingly to avoid "Queue input is backward in time"
+    // warnings while streaming. Tweak both below, before sending each packet.
+    frame->pts = totalSamples;
 
     for (;;) {
       // Ask codec to deliver a packet.
@@ -455,6 +455,9 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
       } else if (result < 0) {
         KJ_FAIL_ASSERT("avcodec_receive_frame()", result, avError(result));
       }
+
+      packet->pts = packet->pts * TIMESTAMP_SCALE / frame->sample_rate;
+      packet->dts = packet->dts * TIMESTAMP_SCALE / frame->sample_rate;
 
       KJ_AVCALL(av_write_frame(formatCtx, packet));
     }
@@ -589,10 +592,23 @@ public:
                 KJ_SYSCALL(ioctl(sock, FIONBIO, &opt));
               }
 
+              kj::StringPtr contentType;
+              if (filename.endsWith(".webm")) {
+                 contentType = "audio/webm; codecs=opus";
+              } else if (filename.endsWith(".ogg")) {
+                 contentType = "audio/ogg; codecs=opus";
+              } else if (filename.endsWith(".aac")) {
+                 contentType = "audio/mp4; codecs=\"mp4a.40.2\"";
+              } else if (filename.endsWith(".mp3")) {
+                 contentType = "audio/mpeg";
+              } else {
+                 KJ_FAIL_ASSERT("unknown audio format", filename);
+              }
+
               kj::FdOutputStream out(kj::mv(sock));
               auto headers = kj::str(
                   "HTTP/1.1 200 OK\r\n"
-                  "Content-Type: audio/ogg\r\n"
+                  "Content-Type: ", contentType, "\r\n"
                   "\r\n");
               out.write(headers.asBytes());
               writeStream(ringBuffers, out, filename);
