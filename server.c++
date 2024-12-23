@@ -592,10 +592,23 @@ public:
                 KJ_SYSCALL(ioctl(sock, FIONBIO, &opt));
               }
 
+              kj::StringPtr contentType;
+              if (filename.endsWith(".webm")) {
+                 contentType = "audio/webm; codecs=opus";
+              } else if (filename.endsWith(".ogg")) {
+                 contentType = "audio/ogg; codecs=opus";
+              } else if (filename.endsWith(".aac")) {
+                 contentType = "audio/mp4; codecs=\"mp4a.40.2\"";
+              } else if (filename.endsWith(".mp3")) {
+                 contentType = "audio/mpeg";
+              } else {
+                 KJ_FAIL_ASSERT("unknown audio format", filename);
+              }
+
               kj::FdOutputStream out(kj::mv(sock));
               auto headers = kj::str(
                   "HTTP/1.1 200 OK\r\n"
-                  "Content-Type: audio/ogg\r\n"
+                  "Content-Type: ", contentType, "\r\n"
                   "\r\n");
               out.write(headers.asBytes());
               writeStream(ringBuffers, out, filename);
