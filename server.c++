@@ -232,13 +232,13 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
   KJ_AVCALL(avcodec_parameters_to_context(codecCtx, stream->codecpar));
   KJ_AVCALL(avcodec_open2(codecCtx, codec, NULL));
 
-  // Allocate a frame buffer.
+  // Allocate a frame. Note that we must NOT allocate a sample buffer to go with it:
+  // avcodec_receive_frame() always calls av_frame_unref() first and then points the frame at
+  // the decoder's own reference-counted buffer. So a buffer we allocated here would simply be
+  // orphaned (leaked) on the first decode, and worse, freeing frame->data[0] at scope exit
+  // would then be freeing the *decoder's* buffer -- which av_frame_free() goes on to free
+  // again, i.e. a double-free.
   kj::Own<AVFrame> frame = KJ_AVALLOC(av_frame);
-  KJ_AVCALL(av_samples_alloc(
-      frame->data, frame->linesize, stream->codecpar->ch_layout.nb_channels,
-      stream->codecpar->sample_rate / 50,  // seems to be ignored?
-      (AVSampleFormat)stream->codecpar->format, LINESIZE_ALIGNMENT));
-  KJ_DEFER(av_freep(&frame->data[0]));
 
   KJ_DEFER(KJ_AVCALL(av_read_pause(formatCtx)));
 
